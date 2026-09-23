@@ -70,15 +70,56 @@ Network hardware: Cudy M1800 router (main unit), cat6e direct cable, Onten OTN-5
 ## Current status
 
 - ✅ Network architecture finalized and validated — direct cable RPC link (942 Mbps) + separate internet paths per machine
-- ⚠️ Open item: the `10.0.0.1` static IP is currently set with `ip addr add`, which doesn't survive a reboot — needs a persistent NetworkManager profile
-- ⏭️ Not started yet: llama.cpp build (CUDA + RPC), GPU pooling tests, Odysseus setup
+- ✅ `10.0.0.1` static IP made persistent via a NetworkManager profile (manual IPv4). Cause of the earlier drops: the profile was on DHCP with no DHCP server on the point-to-point link
+- ⚠️ Still to re-verify: the static IP survives a reboot, and iperf3 still shows ~942 Mbps after the change
+- ✅ **Desktop:** llama.cpp built with CUDA + RPC and verified (details below)
+- ✅ **Desktop:** single-GPU smoke test passed
+- 🔄 **Laptop:** toolchain in progress — driver checked, Git and Visual Studio 2022 Build Tools (MSVC v143) installed; CUDA Toolkit 13.4 and CMake still to install, then clone, checkout and build
+- ⏭️ Not started yet: pooled RPC testing, benchmarking, Odysseus setup
 
 See [BUILD_LOG.md](./BUILD_LOG.md) for the full debugging story, commands used, and lessons learned along the way.
 
+## Build reference
+
+Both machines must build the **same llama.cpp commit**, because the RPC protocol changes between versions.
+
+| | Desktop (CachyOS) | Laptop (Windows) |
+|---|---|---|
+| Pinned commit | `957538960` (build 11141) | `957538960` |
+| CUDA Toolkit | 13.4 | 13.4 (planned) |
+| Host compiler | GCC 16.2.1 | MSVC v143 (Visual Studio 2022 Build Tools) |
+| GPU architecture flag | `75` (Turing) | `120` (Blackwell), planned |
+
+Desktop build:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build --config Release -j6
+```
+
+Laptop build (planned, not yet run): same clone, then `git checkout 957538960`, and configure with `-G "Visual Studio 17 2022"` and `-DCMAKE_CUDA_ARCHITECTURES=120`. The VS 2022 toolset is used deliberately, since MSVC v145 from Visual Studio 2026 is still experimental with `nvcc`.
+
+Notes:
+
+- In this llama.cpp version the RPC worker binary is `ggml-rpc-server` (not `rpc-server`). It binds to `127.0.0.1:50052` by default, so it must be pointed at the direct-link IP to be reachable. RPC has no authentication or encryption, so bind it to the private link address only.
+- Model files live on an NTFS HDD (`/mnt/1TB`, mounted with `ntfs3`). The disk only affects load time, so the model under test is copied to NVMe.
+
+## Measurements so far
+
+| Test | Setup | Result |
+|---|---|---|
+| Network | Direct cable, iperf3 | 942 Mbps, 0 retransmits |
+| Single-GPU smoke test | RTX 2060 Super, Gemma 3 1B Q4_K_M, `-ngl 99` | 160.2 t/s generation, 252.5 t/s prompt |
+
+The 1B model and short prompt make this a pipeline check, not a real benchmark. A 7–8B single-GPU baseline is still to do. Note that pooling is slower than a single GPU for any model that fits on one card, so pooled tests need a model larger than one card's free VRAM (roughly 6.5 GB usable on the desktop while the desktop session is running).
+
 ## Next steps
 
-1. Make the `10.0.0.1` static IP persistent via a NetworkManager connection profile.
-2. Source a second RTL8153-based USB-Ethernet adapter for the Legion laptop, to take the direct RPC cable off the onboard port and protect its hinge-mounted Ethernet jack.
-3. Build llama.cpp with CUDA + RPC support on both machines.
-4. Individual GPU testing → pooled RPC testing → benchmarking.
-5. Set up Odysseus and confirm local multi-device access (both PCs + phone).
+1. Finish the laptop toolchain: CUDA Toolkit 13.4, CMake, then clone to `D:\odysseus`, check out `957538960`, configure and build.
+2. Re-verify the static IP after a reboot and re-run iperf3.
+3. Source a second RTL8153-based USB-Ethernet adapter for the laptop, to take the direct RPC cable off the onboard port and protect its hinge-mounted Ethernet jack.
+4. Single-GPU baseline with a 7–8B Q4 model on the desktop, then on the laptop.
+5. Pooled RPC testing with a model larger than one GPU, then benchmarking.
+6. Set up Odysseus and confirm local multi-device access (both PCs + phone).
+7. Add a `setup.sh` once the full pipeline works end to end.
