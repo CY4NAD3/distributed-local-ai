@@ -72,10 +72,12 @@ Network hardware: Cudy M1800 router (main unit), cat6e direct cable, Onten OTN-5
 - ✅ Network architecture finalized and validated — direct cable RPC link (942 Mbps) + separate internet paths per machine
 - ✅ `10.0.0.1` static IP made persistent via a NetworkManager profile (manual IPv4). Cause of the earlier drops: the profile was on DHCP with no DHCP server on the point-to-point link
 - ⚠️ Still to re-verify: the static IP survives a reboot, and iperf3 still shows ~942 Mbps after the change
-- ✅ **Desktop:** llama.cpp built with CUDA + RPC and verified (details below)
-- ✅ **Desktop:** single-GPU smoke test passed
-- 🔄 **Laptop:** toolchain in progress — driver checked, Git and Visual Studio 2022 Build Tools (MSVC v143) installed; CUDA Toolkit 13.4 and CMake still to install, then clone, checkout and build
-- ⏭️ Not started yet: pooled RPC testing, benchmarking, Odysseus setup
+- ✅ **Desktop:** llama.cpp built with CUDA + RPC and verified
+- ✅ **Laptop:** llama.cpp built with CUDA + RPC and verified (`--list-devices` sees the RTX 5060)
+- ✅ Single-GPU smoke test passed (1B model) and single-GPU baseline done (8B model)
+- ✅ **RPC pooling works end to end** — both GPUs confirmed genuinely participating (`--list-devices` shows `CUDA0` + `RPC0`, `ldd` confirms the RPC backend is linked, and forcing a low `--tensor-split` ratio OOMs the local GPU exactly as expected, proving it holds a real share of the model)
+- ✅ Tensor-split sweep done on the 8B model: found the VRAM ceiling on the desktop GPU (`0.66,1` is the practical floor for its share) and confirmed the split ratio barely affects throughput on a model that already fits on one card (default pipelined split bottlenecks on whichever GPU is slower per layer, not on VRAM headroom)
+- ⏭️ Not started yet: a model too large for one GPU (the real test of pooling), Odysseus setup
 
 See [BUILD_LOG.md](./BUILD_LOG.md) for the full debugging story, commands used, and lessons learned along the way.
 
@@ -86,9 +88,10 @@ Both machines must build the **same llama.cpp commit**, because the RPC protocol
 | | Desktop (CachyOS) | Laptop (Windows) |
 |---|---|---|
 | Pinned commit | `957538960` (build 11141) | `957538960` |
-| CUDA Toolkit | 13.4 | 13.4 (planned) |
+| CUDA Toolkit | 13.4 | 13.4 |
 | Host compiler | GCC 16.2.1 | MSVC v143 (Visual Studio 2022 Build Tools) |
-| GPU architecture flag | `75` (Turing) | `120` (Blackwell), planned |
+| GPU architecture flag | `75` (Turing) | `120` (Blackwell) |
+| Build status | ✅ Built and verified | ✅ Built and verified |
 
 Desktop build:
 
@@ -98,12 +101,23 @@ cmake -B build -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build build --config Release -j6
 ```
 
-Laptop build (planned, not yet run): same clone, then `git checkout 957538960`, and configure with `-G "Visual Studio 17 2022"` and `-DCMAKE_CUDA_ARCHITECTURES=120`. The VS 2022 toolset is used deliberately, since MSVC v145 from Visual Studio 2026 is still experimental with `nvcc`.
+Laptop build:
+
+```powershell
+cd D:\odysseus
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+git checkout 957538960
+cmake -B build -G "Visual Studio 17 2022" -DGGML_CUDA=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --config Release -j
+```
+
+The VS 2022 toolset is used deliberately, since MSVC v145 from Visual Studio 2026 is still experimental with `nvcc`.
 
 Notes:
 
-- In this llama.cpp version the RPC worker binary is `ggml-rpc-server` (not `rpc-server`). It binds to `127.0.0.1:50052` by default, so it must be pointed at the direct-link IP to be reachable. RPC has no authentication or encryption, so bind it to the private link address only.
-- Model files live on an NTFS HDD (`/mnt/1TB`, mounted with `ntfs3`). The disk only affects load time, so the model under test is copied to NVMe.
+- In this llama.cpp version the RPC worker binary is `ggml-rpc-server` (not `rpc-server`). It binds to `127.0.0.1:50052` by default, so it's pointed at the direct-link IP explicitly (`-H 10.0.0.2 -p 50052`) to be reachable. RPC has no authentication or encryption, so it's bound to the private link address only and firewalled to just the desktop's IP.
+- Model files live on an NTFS HDD (`/mnt/1TB/odysseus-models`, mounted with `ntfs3`). This only costs load time (~35–50s for a 5GB model); once weights are in VRAM, inference speed is identical to running from NVMe.
 
 ## Measurements so far
 
@@ -111,15 +125,18 @@ Notes:
 |---|---|---|
 | Network | Direct cable, iperf3 | 942 Mbps, 0 retransmits |
 | Single-GPU smoke test | RTX 2060 Super, Gemma 3 1B Q4_K_M, `-ngl 99` | 160.2 t/s generation, 252.5 t/s prompt |
+| Single-GPU baseline | RTX 2060 Super, Llama 3.1 8B Q4_K_M, `llama-bench -ngl 99` | 1415.00 t/s prompt, 59.98 t/s generation |
+| Pooled via RPC (even split) | Same 8B model, both GPUs, `--rpc 10.0.0.2:50052` | 1222.76 t/s prompt, 60.01 t/s generation |
+| Tensor-split sweep | Same 8B model, `--tensor-split` from 0.50,1 to 1,1 | 0.50–0.65 OOM on desktop GPU (proves the split is real); 0.66–1 all load within ~58–60 t/s of each other |
 
-The 1B model and short prompt make this a pipeline check, not a real benchmark. A 7–8B single-GPU baseline is still to do. Note that pooling is slower than a single GPU for any model that fits on one card, so pooled tests need a model larger than one card's free VRAM (roughly 6.5 GB usable on the desktop while the desktop session is running).
+The 1B model and short prompt make the smoke test a pipeline check, not a real benchmark. The 8B model fits entirely on the desktop's RTX 2060 Super alone, so the pooled numbers above show the split works correctly but can't show a speed benefit — with the default pipelined split mode, generation speed tracks whichever GPU is slower per layer rather than summing both cards' capacity. Pooling only helps once a model doesn't fit on one card, which is the next test.
 
 ## Next steps
 
-1. Finish the laptop toolchain: CUDA Toolkit 13.4, CMake, then clone to `D:\odysseus`, check out `957538960`, configure and build.
+1. **Pooled test with a model too large for one GPU** (~13–14B at Q4, roughly 8–9GB) — the real test of whether pooling helps. Also try `-sm row` or `-sm tensor` alongside the default `-sm layer`, since parallel split modes may behave differently across the network link.
 2. Re-verify the static IP after a reboot and re-run iperf3.
 3. Source a second RTL8153-based USB-Ethernet adapter for the laptop, to take the direct RPC cable off the onboard port and protect its hinge-mounted Ethernet jack.
-4. Single-GPU baseline with a 7–8B Q4 model on the desktop, then on the laptop.
-5. Pooled RPC testing with a model larger than one GPU, then benchmarking.
+4. Single-GPU baseline with the 8B model on the laptop's RTX 5060, for comparison.
+5. Move the 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models`.
 6. Set up Odysseus and confirm local multi-device access (both PCs + phone).
 7. Add a `setup.sh` once the full pipeline works end to end.
