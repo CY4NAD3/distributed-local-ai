@@ -69,17 +69,20 @@ Network hardware: Cudy M1800 router (main unit), cat6e direct cable, Onten OTN-5
 
 ## Current status
 
-- ✅ Network architecture finalized and validated — direct cable RPC link (942 Mbps) + separate internet paths per machine
-- ✅ `10.0.0.1` static IP made persistent via a NetworkManager profile (manual IPv4). Cause of the earlier drops: the profile was on DHCP with no DHCP server on the point-to-point link
-- ⚠️ Still to re-verify: the static IP survives a reboot, and iperf3 still shows ~942 Mbps after the change
+- ✅ **Network architecture finalized and reboot-validated** — direct cable RPC link (942 Mbps, 0 retransmits) + separate internet paths per machine. The `10.0.0.1/24` static IP is persistent through reboot via NetworkManager.
 - ✅ **Desktop:** llama.cpp built with CUDA + RPC and verified
 - ✅ **Laptop:** llama.cpp built with CUDA + RPC and verified (`--list-devices` sees the RTX 5060)
-- ✅ Single-GPU smoke test passed (1B model) and single-GPU baseline done (8B model)
-- ✅ **RPC pooling works end to end** — both GPUs confirmed genuinely participating (`--list-devices` shows `CUDA0` + `RPC0`, `ldd` confirms the RPC backend is linked, and forcing a low `--tensor-split` ratio OOMs the local GPU exactly as expected, proving it holds a real share of the model)
-- ✅ Tensor-split sweep done on the 8B model: found the VRAM ceiling on the desktop GPU (`0.66,1` is the practical floor for its share) and confirmed the split ratio barely affects throughput on a model that already fits on one card (default pipelined split bottlenecks on whichever GPU is slower per layer, not on VRAM headroom)
-- ⏭️ Not started yet: a model too large for one GPU (the real test of pooling), Odysseus setup
+- ✅ **Model storage standardized** — Gemma 3 1B, Llama 3.1 8B, and Qwen2.5 14B models are kept under `/mnt/1TB/odysseus-models` on the desktop; the direct link is also used for transferring models to Legion for solo baselines.
+- ✅ **Single-GPU baselines captured on both GPUs** — 8B: 59.98 t/s on the 2060 Super vs. 68.27 t/s on the 5060. The 14B model hard-OOMs on CachyOS and technically loads on Windows only through WDDM system-memory spillover at 3.38 t/s.
+- ✅ **RPC pooling works end to end** — both GPUs confirmed genuinely participating (`--list-devices` shows `CUDA0` + `RPC0`, `ldd` confirms the RPC backend is linked, and forcing a low `--tensor-split` ratio OOMs the local GPU exactly as expected, proving it holds a real share of the model).
+- ✅ **8B tensor-split sweep completed** — `0.66,1` is the practical floor for the desktop GPU's share; changing the ratio within the working range barely changes generation speed because the default pipelined layer split is limited by the slower GPU.
+- ✅ **14B pooled milestone achieved** — Qwen2.5-14B-Instruct-Q4_K_M runs across both GPUs at **33.65 ± 0.19 t/s generation** and **634.99 ± 4.81 t/s prompt processing**. This is the first model in the project that neither GPU can cleanly run alone at usable speed.
+- ✅ **`-sm row` diagnosis completed** — RPC0 does not support split buffers in this llama.cpp version, so `-sm layer` (the default) is the usable RPC split mode; `-sm tensor` would hit the same backend limitation.
+- ✅ **Odysseus workspace configured on CachyOS** and connected to the working pooled `llama-server` via `LLM_ENDPOINTS=http://localhost:8081/v1`
+- ✅ **Odysseus local interface verified** — reachable from the desktop, Legion, and phone over the LAN on port `7000`
+- ✅ **End-to-end Odysseus inference validated** with the pooled backend, including the Qwen2.5-14B setup; final working configuration and commands are documented
 
-See [BUILD_LOG.md](./BUILD_LOG.md) for the full debugging story, commands used, and lessons learned along the way.
+See [BUILD_LOG.md](./BUILD_LOG.md) for the full debugging story, commands used, benchmark data, and lessons learned along the way.
 
 ## Build reference
 
@@ -121,22 +124,33 @@ Notes:
 
 ## Measurements so far
 
-| Test | Setup | Result |
-|---|---|---|
-| Network | Direct cable, iperf3 | 942 Mbps, 0 retransmits |
-| Single-GPU smoke test | RTX 2060 Super, Gemma 3 1B Q4_K_M, `-ngl 99` | 160.2 t/s generation, 252.5 t/s prompt |
-| Single-GPU baseline | RTX 2060 Super, Llama 3.1 8B Q4_K_M, `llama-bench -ngl 99` | 1415.00 t/s prompt, 59.98 t/s generation |
-| Pooled via RPC (even split) | Same 8B model, both GPUs, `--rpc 10.0.0.2:50052` | 1222.76 t/s prompt, 60.01 t/s generation |
-| Tensor-split sweep | Same 8B model, `--tensor-split` from 0.50,1 to 1,1 | 0.50–0.65 OOM on desktop GPU (proves the split is real); 0.66–1 all load within ~58–60 t/s of each other |
+### Network
 
-The 1B model and short prompt make the smoke test a pipeline check, not a real benchmark. The 8B model fits entirely on the desktop's RTX 2060 Super alone, so the pooled numbers above show the split works correctly but can't show a speed benefit — with the default pipelined split mode, generation speed tracks whichever GPU is slower per layer rather than summing both cards' capacity. Pooling only helps once a model doesn't fit on one card, which is the next test.
+| Test | Result |
+|---|---|
+| Satellite wired path | ~94 Mbps, 0 retransmits — Fast Ethernet negotiation on the satellite LAN port |
+| Satellite bridge | ~154 Mbps average, frequent retransmits |
+| Direct WiFi | ~224 Mbps, frequent retransmits |
+| **Direct cable RPC link** | **942 Mbps, 0 retransmits**, reboot-persistent |
+| Direct-link latency | 1.98 / 2.19 / 2.48 ms min/avg/max, 0% loss |
+| USB adapter → main router | ~109/79 Mbps ISP-capped; adapter negotiates full gigabit |
+
+### Inference
+
+| Test | Setup | Backend | pp512 | tg128 |
+|---|---|---|---:|---:|
+| Solo baseline, 8B | CachyOS, 2060 Super | CUDA | 1415.00 ± 13.77 | 59.98 ± 0.03 |
+| Solo baseline, 8B | Legion, 5060 | CUDA | 2768.76 ± 58.82 | 68.27 ± 0.27 |
+| Solo baseline, 14B | CachyOS, 2060 Super | — | **fails: cudaMalloc OOM** | — |
+| Solo baseline, 14B | Legion, 5060 | CUDA | 168.05 ± 1.82 | **3.38 ± 0.02** (WDDM memory spillover) |
+| Pooled, 8B, even split | CachyOS client + Legion worker | CUDA,RPC | 1222.76 ± 18.40 | 60.01 ± 0.04 |
+| Pooled, 8B, split sweep 0.66–0.70 | CachyOS client + Legion worker | CUDA,RPC | not re-measured | 59.57–59.73 |
+| **Pooled, 14B** | CachyOS client + Legion worker | **CUDA,RPC** | **634.99 ± 4.81** | **33.65 ± 0.19** |
+| Pooled, 14B, `-sm row` | CachyOS client + Legion worker | — | **fails: RPC0 doesn't support split buffers** | — |
+
+The 1B model was only a smoke test: **160.2 t/s generation, 252.5 t/s prompt processing** on the 2060 Super. The 8B model fits on the desktop alone, so pooled 8B generation does not become faster; it tracks the slower 2060 Super rather than summing both GPUs' throughput. The 14B result is the meaningful pooling milestone: neither GPU can cleanly provide a usable solo run, while the pooled run reaches 33.65 t/s.
 
 ## Next steps
 
-1. **Pooled test with a model too large for one GPU** (~13–14B at Q4, roughly 8–9GB) — the real test of whether pooling helps. Also try `-sm row` or `-sm tensor` alongside the default `-sm layer`, since parallel split modes may behave differently across the network link.
-2. Re-verify the static IP after a reboot and re-run iperf3.
-3. Source a second RTL8153-based USB-Ethernet adapter for the laptop, to take the direct RPC cable off the onboard port and protect its hinge-mounted Ethernet jack.
-4. Single-GPU baseline with the 8B model on the laptop's RTX 5060, for comparison.
-5. Move the 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models`.
-6. Set up Odysseus and confirm local multi-device access (both PCs + phone).
-7. Add a `setup.sh` once the full pipeline works end to end.
+1. **Optional hardware refinement:** source the second RTL8153-based USB-Ethernet adapter for Legion. This is **not blocking** the build; it would free the hinge-mounted onboard Ethernet port from repeated cable use.
+2. **Automation:** add a `setup.sh` (or equivalent setup documentation) to make the final working pipeline reproducible from a clean setup.
