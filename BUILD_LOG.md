@@ -1,6 +1,6 @@
 # Build Log — Project Odysseus
 
-The full debugging story behind the network layer and the llama.cpp build — including the dead ends and every command used. See [README.md](./README.md) for the project overview and current status.
+This is the chronological build record for the distributed-local-ai project. Commands, outputs, measurements, failed attempts, diagnostics, and lessons learned are preserved below; sections are grouped so the progression from hardware/network setup → llama.cpp/RPC → pooled inference → Odysseus is easier to follow.
 
 ## Hardware
 
@@ -427,6 +427,284 @@ See the full comparison table in section 6. Headline results:
 
 Both machines are built on commit `957538960` and the RPC link works end to end, with the layer split confirmed both structurally (section 5) and via solo-baseline comparison (section 6). Real proof-of-pooling achieved on the 14B model.
 
+## 7. Odysseus integration — native local deployment (2026-09-25)
+
+With the llama.cpp RPC layer proven, the next phase was connecting the pooled inference server to Odysseus. The goal was to use the local Qwen 14B pooled model through Odysseus rather than talking to `llama-server` directly.
+
+### Odysseus repository / initial inspection
+
+The Odysseus repository was cloned and inspected locally. The README was fetched during initial setup:
+
+```bash
+curl -L https://raw.githubusercontent.com/apexEvan/odysseus/main/README.md | head -80
+```
+
+Odysseus was run natively on CachyOS rather than adding another Docker layer. This keeps the current setup simpler and avoids the additional memory overhead of another container stack.
+
+### Verify the local llama-server endpoint first
+
+Before touching Odysseus, the local OpenAI-compatible API was tested directly.
+
+```bash
+curl http://127.0.0.1:8081/health
+```
+
+Result:
+
+```json
+{"status":"ok"}
+```
+
+Model discovery:
+
+```bash
+curl http://127.0.0.1:8081/v1/models
+```
+
+The Qwen model appeared:
+
+```text
+/mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+```
+
+Direct chat-completion test:
+
+```bash
+curl -s http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":10}'
+```
+
+Result:
+
+```text
+Hello
+```
+
+This isolated the inference layer successfully: `llama-server` was healthy, the model was registered, and the OpenAI-compatible chat endpoint worked before Odysseus was introduced.
+
+### Connect Odysseus to llama-server
+
+Initial inspection of `.env` showed the endpoint configuration. It was corrected to:
+
+```bash
+grep -n "LLM_ENDPOINTS" .env
+sed -i 's|^LLM_ENDPOINTS=.*|LLM_ENDPOINTS=http://localhost:8081/v1|' .env
+grep -n "LLM_ENDPOINTS" .env
+```
+
+Final value:
+
+```text
+LLM_ENDPOINTS=http://localhost:8081/v1
+```
+
+After restarting/reloading Odysseus, the Qwen 14B model appeared in the Odysseus interface and produced a response.
+
+**Milestone:** the pooled local llama.cpp inference backend is now usable through Odysseus.
+
+### Odysseus health / web UI
+
+The Odysseus web application was tested locally:
+
+```bash
+curl -I http://127.0.0.1:7000
+```
+
+Returned:
+
+```text
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+server: granian
+```
+
+The startup script was inspected:
+
+```bash
+grep -nE 'HOST|host|7000|uvicorn|granian' ./scripts/start
+```
+
+It showed that the script launches Uvicorn on port `7000` and defaults the host to `127.0.0.1`.
+
+To make Odysseus reachable from other devices on the LAN, it was started with:
+
+```bash
+ODYSSEUS_HOST=0.0.0.0 ./scripts/start
+```
+
+The listener was then verified:
+
+```bash
+ss -ltnp | grep 7000
+```
+
+Result:
+
+```text
+LISTEN ... 0.0.0.0:7000 ... users:(("uvicorn",...))
+```
+
+So the application itself was correctly listening on all IPv4 interfaces.
+
+### Why the first Legion LAN test failed
+
+The first test used an old desktop address:
+
+```text
+http://192.168.10.139:7000
+```
+
+The Legion could not reach it:
+
+```powershell
+Test-NetConnection 192.168.10.139 -Port 7000
+ping 192.168.10.139
+```
+
+The result was `DestinationHostUnreachable`, and Windows reported no ARP entry for the address.
+
+The actual interface state was then checked.
+
+Legion:
+
+```powershell
+ipconfig
+```
+
+showed WiFi:
+
+```text
+192.168.10.151/24
+gateway 192.168.10.1
+```
+
+CachyOS:
+
+```bash
+ip addr
+ip route
+```
+
+showed:
+
+```text
+enp3s0       10.0.0.1/24
+enp1s0f0u1   192.168.10.115/24
+```
+
+and the default route went through:
+
+```text
+192.168.10.1 dev enp1s0f0u1
+```
+
+Thus the desktop's home-LAN address had changed to `192.168.10.115`; `192.168.10.139` was stale.
+
+The two machines also demonstrated that they were on the same home LAN at the time:
+
+```bash
+ping -c 4 192.168.10.151
+```
+
+from CachyOS succeeded with 0% packet loss.
+
+### Current LAN firewall state
+
+UFW was checked:
+
+```bash
+sudo ufw status
+```
+
+At the time, the rules included ports such as `8096`, `5201`, and the RPC/file-transfer rules, but **TCP 7000 was not yet allowed from the home LAN**.
+
+Therefore the remaining LAN-access task is:
+
+1. Use the current desktop home-LAN address (`192.168.10.115` at the time of this test).
+2. Allow TCP 7000 from `192.168.10.0/24` in UFW.
+3. Test `http://192.168.10.115:7000` from the Legion.
+4. Test the same URL from a phone on the home WiFi.
+5. Only after LAN access works, consider remote access from outside the home.
+
+Do **not** expose the llama.cpp RPC port `50052` to the LAN or Internet. RPC has no authentication/encryption and should remain restricted to the private direct link.
+
+### Odysseus web-search integration
+
+The source tree was inspected for search functionality:
+
+```bash
+grep -RniE 'searx|search' config core src services mcp_servers routes 2>/dev/null | head -50
+```
+
+Relevant findings included:
+
+```text
+config/searxng/settings.yml
+core/constants.py
+src/agent_loop.py
+src/agent_tools.py
+```
+
+The codebase contains a `web_search` tool and a `trigger_research` path. The agent instructions explicitly distinguish quick `web_search` lookups from deeper research jobs.
+
+Odysseus Settings showed:
+
+```text
+Provider: SearXNG (self-hosted)
+Results: 5
+Active: SearXNG
+```
+
+The self-hosted instance is configured through the environment variable used by Odysseus:
+
+```text
+SEARXNG_INSTANCE=http://localhost:8080
+```
+
+The important distinction discovered during testing is that **having SearXNG selected in Settings does not by itself prove the model is invoking the web-search tool**. The local Qwen 14B model initially answered a "latest NVIDIA news" request with a generic statement that it could not perform real-time searches and invented placeholder article descriptions.
+
+This is a tool-use/integration verification issue, not evidence that the llama.cpp endpoint is broken. The next test is to verify the SearXNG endpoint itself and then confirm that Odysseus emits/executes a `web_search` tool call.
+
+### Accidental source modification by the local model
+
+While experimenting with shell/tool access, the local model was given access to Odysseus's project files. It modified `app.py` incorrectly, replacing the real application with a small Flask example.
+
+The resulting file began with indented code such as:
+
+```python
+   from flask import Flask, request, jsonify
+   app = Flask(__name__)
+```
+
+Starting Odysseus then failed with:
+
+```text
+IndentationError: unexpected indent
+```
+
+Git immediately showed the problem:
+
+```bash
+git status --short app.py
+git diff -- app.py
+```
+
+The diff showed that the original roughly 966-line Odysseus `app.py` had been replaced by a 15-line unrelated Flask example.
+
+This was an important security/workflow lesson: Odysseus's shell/tool access is real and can modify the host project. A local model should not be assumed to be read-only merely because it is running locally.
+
+For recovery, the project should use Git to restore accidental changes rather than manually reconstructing the application:
+
+```bash
+git status --short
+git diff -- app.py
+git restore app.py
+git status --short
+```
+
+Only run `git restore` after confirming that the changes are unwanted, because it discards uncommitted edits to that file.
+
 ## Command reference — everything run during network setup, debugging and the build
 
 ### Installing iperf3
@@ -723,3 +1001,21 @@ cd D:\odysseus\llama.cpp
 - **Windows' WDDM shared GPU memory masks true VRAM limits**: an oversized model doesn't hard-fail on Windows the way it does on Linux (`cudaMalloc` OOM) — it can silently spill into system RAM and run at a fraction of normal speed instead. A Windows solo run "succeeding" on paper isn't proof the GPU actually held the model; check the token rate, not just whether it loaded.
 - **A direct link doubles as a private file-transfer channel**: serving a models folder with `python -m http.server` bound to the direct-link IP and pulling with `curl.exe` moved multi-gigabyte files at line-rate in place of a multi-minute WiFi/ISP redownload. Needed a scoped `ufw` rule opening the serving port to the peer's IP specifically, the same pattern already used for the RPC port.
 - **Comparing solo baselines on both cards, not just one, makes pooled numbers interpretable**: the pooled 8B tg128 (60.01 t/s) sitting almost exactly at the 2060 Super's solo number (59.98) rather than the 5060's (68.27) is what actually proves — with real numbers instead of inference — that pipelined layer-split caps throughput at the slowest card in the chain.
+
+## Current project status and next steps
+
+### Current phase status
+
+At this point:
+
+- ✅ llama.cpp CUDA + RPC build complete on both machines.
+- ✅ Direct 942 Mbps RPC link complete and reboot-persistent.
+- ✅ 8B pooled inference verified and characterized.
+- ✅ 14B pooled inference milestone achieved: **33.65 t/s generation**.
+- ✅ Both GPUs confirmed to participate in pooled 14B generation.
+- ✅ Odysseus running natively on CachyOS.
+- ✅ Odysseus connected to the local llama.cpp OpenAI-compatible endpoint.
+- ✅ Odysseus local web UI responds on port `7000`.
+- ⚠️ Home-LAN/phone access not finished; desktop IP changed and TCP 7000 still needs the appropriate UFW rule.
+- ⚠️ SearXNG/web-search integration selected but not yet end-to-end verified.
+- ⚠️ Remote access from outside home intentionally postponed until local LAN access is stable.
