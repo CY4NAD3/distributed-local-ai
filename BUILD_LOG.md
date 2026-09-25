@@ -49,11 +49,13 @@ The same "Public network profile" firewall issue appeared again on this fresh in
 
 **Result: 942 Mbps sustained, zero retransmits, for the full 30-second test — reproduced identically on a later re-test after unrelated network reconfiguration.** Essentially gigabit line-rate.
 
+**Reboot persistence — confirmed 2026-09-25.** The original `10.0.0.1/24` on `enp3s0` had been set live via `sudo ip addr add`, which doesn't survive a NetworkManager restart/reboot, and was replaced with a proper `nmcli` connection profile. This session's reboot check confirms that fix held: the address came back automatically after a restart and a fresh `iperf3` run still landed at the same ~942 Mbps line-rate. This item is now fully closed.
+
 ## 3. Final architecture — dual-NIC on CachyOS
 
 The direct cable solved the RPC link but left CachyOS with no internet (its one onboard NIC was now dedicated to Legion). Solved with a second NIC:
 
-- **`enp3s0`** (onboard, static `10.0.0.1`) → direct cat6e cable → **Legion onboard NIC** (`10.0.0.2`) — dedicated, isolated RPC link. Validated at 942 Mbps.
+- **`enp3s0`** (onboard, static `10.0.0.1`) → direct cat6e cable → **Legion onboard NIC** (`10.0.0.2`) — dedicated, isolated RPC link. Validated at 942 Mbps, reboot-persistent (see above).
 - **USB-to-Ethernet adapter** (Onten OTN-5225D, Realtek **RTL8153** chipset, USB 3.0, shows as `enp1s0f0u1`, confirmed via `lsusb` ID `0bda:8153`) → cat6e cable → **main Cudy M1800 router directly** (satellite no longer used at all). `ethtool` confirms `1000Mb/s` link negotiation; real throughput matches the ISP plan (~109/79 Mbps via `speedtest-cli`/fast.com — ISP-capped, not adapter-capped).
 - **Legion's internet**: via WiFi (`192.168.10.151`), independent of the RPC link — its onboard Ethernet port is fully dedicated to the direct cable.
 
@@ -63,17 +65,17 @@ The direct cable solved the RPC link but left CachyOS with no internet (its one 
 
 **Explored but not needed:** powerline adapters, wired mesh backhaul, a second gigabit switch — direct cable + dual-NIC solved it more simply than any of these.
 
-**Static IP persistence:** the original `10.0.0.1/24` on `enp3s0` was set live via `sudo ip addr add`, which doesn't survive a NetworkManager restart/reboot. Replaced with a proper `nmcli` connection profile so the address comes back automatically. Reboot re-verification (`ip -br addr show enp3s0` should still read `10.0.0.1/24`, plus an `iperf3` re-check at ~942 Mbps) is **still not confirmed**. On 2026-09-24, `ping -c 3 10.0.0.2` from CachyOS returned 3/3 replies (0% loss, 1.98/2.19/2.48 ms min/avg/max), so the link and both addresses are up, but that isn't the reboot test — do that before calling this fully closed.
+**A second, unplanned use for the direct link:** the same cable doubles as a private file-transfer channel between the two machines. Serving a model folder with `python -m http.server` bound to `10.0.0.1` and pulling it with `curl.exe` from Legion moves multi-gigabyte `.gguf` files at line-rate instead of re-downloading them over Legion's much slower WiFi/ISP path. See section 6.
 
 ## Next up (network)
 
 Buying a **second RTL8153-based USB-Ethernet adapter for Legion**, sourced in person through an ISP technician contact rather than an unbranded online listing. This will take over the direct RPC cable on Legion's end, freeing Legion's onboard Ethernet port (a fragile hinge-mounted connector) from repeated plug/unplug wear. Not required to keep building — the current onboard-to-onboard link is what's in use.
 
-## 4. Inference layer — llama.cpp build (both machines built and verified; pooled run done, layer split confirmed)
+## 4. Inference layer — llama.cpp build (both machines built and verified; 8B and 14B pooled runs done, layer split confirmed, solo baselines on both GPUs captured)
 
 With the network link validated, moved on to building `llama.cpp` with CUDA + RPC support on both machines, so CachyOS can run `llama-server` as the main node and Legion can run `ggml-rpc-server` as a worker, pooling the 2060 Super and 5060 into one inference target.
 
-The subsections below are grouped per machine, but the work was interleaved. Actual order of events (2026-09-23 → 2026-09-25, the first session ran past midnight):
+The subsections below are grouped per machine, but the work was interleaved. Actual order of events (2026-09-23 → 2026-09-25, spanning multiple sessions):
 
 1. CachyOS: checked the existing CUDA install (already present from hashcat work).
 2. CachyOS: installed `cmake`.
@@ -93,6 +95,10 @@ The subsections below are grouped per machine, but the work was interleaved. Act
 16. CachyOS: first pooled `llama-bench` run with `--rpc` (pp512 1223 t/s, tg128 60.01 t/s). At this point how the layers were actually split was not yet verified.
 17. CachyOS: confirmed the split is real — `--rpc 10.0.0.2:50052 --list-devices` lists both `CUDA0` (2060 Super) and `RPC0` (Legion), and `ldd ./build/bin/llama-server | grep -i rpc` shows `libggml-rpc.so.0` linked.
 18. CachyOS: swept `--tensor-split` on the 8B model to find the OOM boundary on the 2060 Super and check whether the split ratio moves throughput. See section 5.
+19. CachyOS: downloaded Qwen2.5-14B-Instruct-Q4_K_M (8.37 GiB) — the first model too big for either single 8GB GPU — confirmed the solo OOM, then ran and verified the pooled milestone. See section 6.
+20. CachyOS: attempted `-sm row` on the 14B pooled run; diagnosed the failure via a verbose log. See section 6.
+21. Moved the gemma 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models` (deferred item from section 5, now done).
+22. CachyOS ↔ Legion: transferred both the 8B and 14B `.gguf` files to Legion over the direct link via a temporary `python -m http.server`, then ran solo `llama-bench` baselines on the 5060 for both models. See section 6.
 
 ### CachyOS
 
@@ -143,9 +149,9 @@ find ~/.cache -iname "*gemma-3-1b*"
 cp -L ~/.cache/huggingface/hub/models--ggml-org--gemma-3-1b-it-GGUF/snapshots/*/gemma-3-1b-it-Q4_K_M.gguf ~/odysseus/models/
 ./build/bin/llama-cli -m ~/odysseus/models/gemma-3-1b-it-Q4_K_M.gguf -ngl 99 -p "..."   # -m = load a file directly, no download logic
 ```
-From here on, models are downloaded manually (`wget -c`) into a folder chosen on purpose and loaded with `-m`. This also gives the same path on both machines.
+From here on, models are downloaded manually (`wget -c`) into a folder chosen on purpose and loaded with `-m`. This also gives the same path on both machines. The 1B smoke-test file was later moved from `~/odysseus/models` to `/mnt/1TB/odysseus-models/` to match every other model's location.
 
-**Storage:** `/home` has ~71 GB free (btrfs). The NTFS drives are already auto-mounted through `/etc/fstab` with the in-kernel `ntfs3` driver (`rw,nofail,uid=1000,gid=1000`): `/mnt/1TB` (HDD, drive label "1 TB Drive", ~213 GB free) and `/mnt/Records`. `mount | grep 1TB` confirmed `/dev/sdb1 on /mnt/1TB type ntfs3 (rw,...,uid=1000,...)`, so no permission problems. **Plan changed:** all models now live on the HDD in `/mnt/1TB/odysseus-models/` instead of being copied to NVMe for benchmarks — the HDD only affects model *load* time (roughly 35–50 s for the 4.9 GB 8B file, more for bigger models), not inference speed, and NVMe space is limited. The NVMe "SSD samsung" partition (`nvme0n1p5`, ~99 GB free) is mounted by the desktop under `/run/media/`, a path with a space that isn't stable, so it was left out. The label ("1 TB Drive", shown in Dolphin) and the mount point (`/mnt/1TB`, used in the terminal) are two names for the same drive. The 1B smoke-test file is still in `~/odysseus/models`; moving it to the HDD is planned.
+**Storage:** `/home` has ~71 GB free (btrfs). The NTFS drives are already auto-mounted through `/etc/fstab` with the in-kernel `ntfs3` driver (`rw,nofail,uid=1000,gid=1000`): `/mnt/1TB` (HDD, drive label "1 TB Drive", ~213 GB free) and `/mnt/Records`. `mount | grep 1TB` confirmed `/dev/sdb1 on /mnt/1TB type ntfs3 (rw,...,uid=1000,...)`, so no permission problems. **Plan changed:** all models now live on the HDD in `/mnt/1TB/odysseus-models/` instead of being copied to NVMe for benchmarks — the HDD only affects model *load* time (roughly 35–50 s for the 4.9 GB 8B file, more for bigger models), not inference speed, and NVMe space is limited. The NVMe "SSD samsung" partition (`nvme0n1p5`, ~99 GB free) is mounted by the desktop under `/run/media/`, a path with a space that isn't stable, so it was left out. The label ("1 TB Drive", shown in Dolphin) and the mount point (`/mnt/1TB`, used in the terminal) are two names for the same drive.
 
 **8B download and single-GPU baseline:**
 ```bash
@@ -229,7 +235,7 @@ The `bash -c` wrapper exists because `/dev/tcp` is a bash feature that fish does
 ```
 - The backend column read `CUDA,RPC`; the Legion's worker log showed `CUDA graph warmup complete`, so the 5060 really computed for CachyOS.
 - **pp512 1222.76 ± 18.40 t/s, tg128 60.01 ± 0.04 t/s** — prompt processing about 14% below the single-GPU baseline (1415), generation identical to it (59.98).
-- **Read this with care:** an 8B Q4 model fits on the 2060 Super alone, so pooling can't be expected to help, and the identical tg128 raised the question of how much of the model actually went to the Legion. Resolved in section 5.
+- **Read this with care:** an 8B Q4 model fits on the 2060 Super alone, so pooling can't be expected to help, and the identical tg128 raised the question of how much of the model actually went to the Legion. Resolved in section 5, and further explained by the Legion solo baseline in section 6.
 
 ## 5. Layer-split verification and tensor-split sweep (2026-09-25)
 
@@ -269,42 +275,157 @@ Benchmark prompt used for the 1000-token runs: *"Write a very detailed explanati
 **Findings:**
 - **The split is real.** `0.50`–`0.65` failing with a CUDA0 out-of-memory error while trying to allocate the KV cache buffer is direct proof CUDA0 (the 2060 Super) was being asked to hold a specific, non-trivial share of the model — a purely-remote setup wouldn't OOM the local card at all. `0.66` is the practical lower bound for CUDA0's share before the 2060 Super runs out of the ~6.4 GB llama.cpp reports free.
 - **The split ratio barely moves throughput.** Every successful split — including the even `1,1` split — lands in the same ~58.4–60.0 t/s band, and that spread shows up *within* a single run (task-to-task) as much as it does *between* different split ratios. `0.68,1`'s 59.73 t/s is not a meaningful win over `0.67,1`'s 59.60–59.69 t/s.
-- **Why:** the default split mode is `-sm layer` (pipelined) — each token's forward pass runs through CUDA0's layers, then RPC0's layers, in sequence. The two GPUs never compute simultaneously on the same token, so total tg tracks whichever GPU is slower per layer, not the sum of both cards' capacity. Shifting the ratio changes *which* GPU is closer to being the bottleneck, but with two cards of broadly similar per-layer speed on a model that already fits, it doesn't change the outcome much.
+- **Why:** the default split mode is `-sm layer` (pipelined) — each token's forward pass runs through CUDA0's layers, then RPC0's layers, in sequence. The two GPUs never compute simultaneously on the same token, so total tg tracks whichever GPU is slower per layer, not the sum of both cards' capacity. Shifting the ratio changes *which* GPU is closer to being the bottleneck, but with two cards of broadly similar per-layer speed on a model that already fits, it doesn't change the outcome much. Section 6's solo Legion baseline later confirms this directly: pooled tg128 tracks the *slower* card's solo speed almost exactly.
 - **The `compute buffer allocation failed, retrying without pipeline parallelism` warning at 0.66–0.69** is a secondary symptom of the same VRAM ceiling: llama.cpp tries to reserve a pipelining compute buffer on CUDA0, can't fit it in the remaining headroom, and falls back to non-pipelined execution automatically. It didn't cost throughput here, but it's a sign this GPU is right at its limit for this split range.
-- **Practical takeaway:** for a model that fits on one card, tensor-split tuning isn't worth the time — pick something that loads cleanly without the fallback warning (e.g. `1,1` or `0.70,1`) and move on. The real test of pooling is a model that requires the combined VRAM to run at all.
+- **Practical takeaway:** for a model that fits on one card, tensor-split tuning isn't worth the time — pick something that loads cleanly without the fallback warning (e.g. `1,1` or `0.70,1`) and move on. The real test of pooling is a model that requires the combined VRAM to run at all — see section 6.
 
-### Open items (inference layer)
+## 6. The 14B pooling milestone, `-sm row` diagnosis, and solo GPU baselines (2026-09-25, continued)
 
-1. **Pooled test with a model larger than one card's free VRAM** (~13–14B at Q4, about 8–9 GB), which can only run through the pool. This is the real test of whether pooling helps, since the 8B tests above were bottlenecked by the slower GPU per layer regardless of tensor-split ratio. Benchmark tok/s, GPU utilization, VRAM, and try `-sm row` or `-sm tensor` in addition to the default `layer` split, since parallel split modes may behave differently across a slow network link than the pipelined default. Consider `-c` on the worker to avoid re-sending weights on every restart.
-2. Reboot check of the `10.0.0.1` static IP and an `iperf3` re-run (still unconfirmed).
-3. Baseline of the same 8B model on the 5060 alone (Legion), for comparison.
-4. Move the 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models`.
-5. README status section needs updating to match this log.
+Goal: the real proof-of-pooling test — a model too big for either single 8GB card — plus the deferred solo-baseline comparisons on the Legion's 5060.
+
+### 14B download and the solo OOM
+
+```bash
+cd /mnt/1TB/odysseus-models
+wget -c https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+```
+Downloaded **Qwen2.5-14B-Instruct-Q4_K_M (8.37 GiB, 14.77B params)** to `/mnt/1TB/odysseus-models`.
+
+Confirmed it does **not** fit on the 2060 Super alone:
+```fish
+./build/bin/llama-bench -m /mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99
+```
+Failed with `cudaMalloc failed: out of memory`, trying to allocate an **8148.38 MiB** CUDA0 buffer. This is the first model in the project genuinely too big for either single 8GB GPU — the real test case for pooling.
+
+### Pooled run — the milestone
+
+```fish
+./build/bin/llama-bench -m /mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99 --rpc 10.0.0.2:50052
+```
+Loaded and ran cleanly, backend `CUDA,RPC`:
+
+| test | result |
+|---|---|
+| pp512 | **634.99 ± 4.81 t/s** |
+| tg128 | **33.65 ± 0.19 t/s** |
+
+A model that fits nowhere else is running on pooled VRAM at a usable speed — 33.65 t/s reads naturally to a human, comparable to typical hosted-chat output speed.
+
+### GPU utilization — confirmed both cards genuinely compute together
+
+Ran `llama-server` (with `--ctx-size 8192 -np 1` to cut KV cache size) plus a `curl` completion request, while logging `nvidia-smi --query-gpu=utilization.gpu,power.draw --format=csv -l 1` to a file on **both machines simultaneously**.
+
+- **CachyOS (2060 Super):** clean ~10s burst at 42–44% utilization, 140–160W (vs ~0–17%/~50W idle baseline).
+- **Legion (5060):** matching ~8–9s burst at 46–57% utilization at the same point in time. Legion's power-draw column was flat/broken (~5W throughout — a known laptop-GPU reporting quirk), so only its utilization column is trustworthy, but that alone confirms both GPUs genuinely compute together during pooled generation, not just one card doing all the work with the other idling.
+
+### `-sm row` — diagnosed and closed as a negative result
+
+Attempted the parallel/row split mode (rows of each tensor spread across both devices simultaneously, instead of the default pipelined per-layer relay) on the same 14B model:
+```fish
+./build/bin/llama-bench -m /mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99 --rpc 10.0.0.2:50052 -sm row -v 2>&1 | tee /tmp/row_test.log
+```
+Model metadata loaded fine (both `RPC0` and `CUDA0` were detected with free-VRAM figures), then failed at tensor-loading time:
+```
+llama_model_load: error loading model: device RPC0 does not support split buffers
+llama_model_load_from_file_impl: failed to load model
+```
+**Diagnosis:** this is not a config mistake or a VRAM issue — the RPC backend in this llama.cpp build doesn't implement split buffers, the mechanism row-wise (and tensor-wise) split modes need to hand a device a *partial* tensor it manages locally. The RPC backend only knows how to hand a device a set of whole layers, so as soon as `-sm row` tries to give `RPC0` a split buffer, loading aborts immediately. The same limitation would apply to `-sm tensor`. **Conclusion: `-sm layer` (the default, already in use) is the only split mode usable for pooled RPC inference in this build/version.** Logged as a clean negative result — no further `-sm` mode testing planned unless a future llama.cpp version adds RPC split-buffer support.
+
+### Cross-machine model transfer over the direct link
+
+Needed the 8B and 14B `.gguf` files on Legion's disk for solo baselines, without re-downloading over WiFi/ISP. Used the direct RPC link itself as a private file-transfer channel:
+
+On CachyOS:
+```bash
+cd /mnt/1TB/odysseus-models
+python -m http.server 8000 --bind 10.0.0.1
+```
+On Legion:
+```powershell
+cd D:\odysseus\models
+curl.exe -o Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf http://10.0.0.1:8000/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+curl.exe -o Qwen2.5-14B-Instruct-Q4_K_M.gguf http://10.0.0.1:8000/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+```
+First attempt failed with `curl: (28) Failed to connect to 10.0.0.1:8000 after 21038 ms` — `ufw` on CachyOS only had the RPC port (50052) opened, not 8000. Fixed with a scoped rule matching the existing RPC one:
+```bash
+sudo ufw allow from 10.0.0.2 to any port 8000 proto tcp
+```
+After that, both files transferred at (effectively) direct-link speed — multiple gigabytes moved in well under a minute each, versus the original 6-minute ISP-limited download for the 8B file alone.
+
+### Legion (5060) solo baselines
+
+**8B model:**
+```powershell
+.\build\bin\Release\llama-bench.exe -m D:\odysseus\models\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf -ngl 99
+```
+| test | result |
+|---|---|
+| pp512 | **2768.76 ± 58.82 t/s** |
+| tg128 | **68.27 ± 0.27 t/s** |
+
+Nearly double the 2060 Super's solo prompt-processing speed (1415), and noticeably faster generation too (68.27 vs 59.98) — the 5060 is the faster of the two cards.
+
+**14B model:**
+```powershell
+.\build\bin\Release\llama-bench.exe -m D:\odysseus\models\Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99
+```
+| test | result |
+|---|---|
+| pp512 | **168.05 ± 1.82 t/s** |
+| tg128 | **3.38 ± 0.02 t/s** |
+
+Unlike CachyOS, this did **not** hard-fail with an out-of-memory error — it loaded and ran, just at roughly **1/10th** the pooled speed (3.38 t/s vs. 33.65 t/s pooled).
+
+**Why no OOM crash on Windows:** this is a Windows vs. Linux CUDA behavior difference, not a Legion-specific quirk. On Linux, `cudaMalloc` hard-fails once a request exceeds free VRAM — that's the clean OOM error CachyOS hit on this same model. On Windows, **WDDM (the graphics driver model) supports shared GPU memory** — when a CUDA allocation exceeds VRAM, the driver can silently spill the overflow into system RAM instead of refusing the allocation outright. The 5060 accepted the model, but part of it ended up sitting in system RAM, and every token touching those spilled layers pays a PCIe round-trip instead of a VRAM access — hence 3.38 t/s instead of a clean failure. Practical implication: a Windows solo run "succeeding" on an oversized model doesn't mean the GPU actually held it — check the token rate, not just whether it loaded.
+
+### What the solo baselines explain about the pooled numbers
+
+- **8B pooled (60.01 t/s) sits almost exactly at the 2060 Super's solo number (59.98)**, not anywhere near the 5060's solo number (68.27). This directly confirms the section 5 analysis: with the default pipelined `-sm layer` mode, each token relays through CUDA0's layers then RPC0's layers in sequence, so total generation speed is capped by the *slower* card — the faster 5060 spends part of every token idle, waiting on the 2060 Super. Pooling an 8B model that already fits on one card is strictly worse than just running it solo on the faster of the two cards.
+- **14B pooled (33.65 t/s) beats the 5060's own degraded solo run (3.38 t/s) by roughly 10x**, and both single-GPU options for this model are non-viable (CachyOS: hard OOM; Legion: technically loads but crawls via WDDM memory spillover). This is the strongest result in the project so far: pooling isn't just "faster" here, it's the only way to run this model at a genuinely usable speed on this hardware.
+
+### Updated full comparison table
+
+| Test | Setup | Backend | pp512 | tg128 |
+|---|---|---|---|---|
+| Solo baseline, 8B | CachyOS, 2060 Super | CUDA | 1415.00 ± 13.77 | 59.98 ± 0.03 |
+| Solo baseline, 8B | Legion, 5060 | CUDA | 2768.76 ± 58.82 | 68.27 ± 0.27 |
+| Solo baseline, 14B | CachyOS, 2060 Super | — | **fails: cudaMalloc OOM** | — |
+| Solo baseline, 14B | Legion, 5060 | CUDA | 168.05 ± 1.82 | **3.38 ± 0.02** (WDDM memory spillover, not a clean run) |
+| Pooled, 8B, even split | CachyOS client + Legion worker | CUDA,RPC | 1222.76 ± 18.40 | 60.01 ± 0.04 |
+| Pooled, 8B, split sweep 0.66–0.70 | CachyOS client + Legion worker | CUDA,RPC | not re-measured | 59.57–59.73 |
+| **Pooled, 14B** | CachyOS client + Legion worker | CUDA,RPC | **634.99 ± 4.81** | **33.65 ± 0.19** |
+| Pooled, 14B, `-sm row` | CachyOS client + Legion worker | — | **fails: RPC0 doesn't support split buffers** | — |
+
+### Open items (inference layer) — remaining
+
+1. **README.md status section** — needs updating to match this log (in progress alongside this update).
+2. Second RTL8153 USB-Ethernet adapter for Legion (network-layer item, not blocking; see section 3).
+3. Next phase: Odysseus workspace install on CachyOS, once documentation is caught up — not started yet.
+
+Everything else from the earlier open-items list (reboot check, gemma 1B move, solo 5060 baseline, `-sm row` diagnosis) is now closed as of this session.
 
 ## Benchmark results
 
-**Network layer (complete):**
+**Network layer (complete, reboot-persistence confirmed):**
 
 | Path | Avg throughput | Retransmits | Notes |
 |---|---|---|---|
 | Satellite (wired both ends) | ~94 Mbps | 0 (flat cap) | Fast Ethernet negotiation on satellite LAN port |
 | Satellite bridge (CachyOS on main router, Legion on satellite) | ~154 Mbps | Frequent | Wireless backhaul instability |
 | Direct WiFi (Legion, no satellite bridging) | ~224 Mbps | Frequent | Better than bridged, still unstable |
-| **Direct cable (onboard-to-onboard)** | **942 Mbps** | **0** | Adopted — gigabit line-rate |
+| **Direct cable (onboard-to-onboard)** | **942 Mbps** | **0** | Adopted — gigabit line-rate; reboot-persistent, re-verified 2026-09-25 |
 | USB adapter → main router (internet) | ISP-capped (~109/79 Mbps) | — | Adapter itself negotiates full gigabit via `ethtool` |
 
 Direct link latency on 2026-09-24: ping 1.98 / 2.19 / 2.48 ms (min/avg/max), 0% loss.
 
-**Inference layer (8B model fully characterized; larger-than-VRAM model still to test):**
+**Inference layer (complete — 8B and 14B fully characterized solo and pooled on both GPUs):**
 
-| Test | Setup | Prompt (pp512) | Generation (tg128) | Notes |
-|---|---|---|---|---|
-| Single GPU, smoke test | RTX 2060 Super, Gemma 3 1B Q4_K_M, `llama-cli`, commit `957538960` | 252.5 t/s | 160.2 t/s | Tiny model and short prompt; pipeline check only |
-| **Single GPU, baseline** | RTX 2060 Super, Llama 3.1 8B Q4_K_M (4.58 GiB), `llama-bench -ngl 99` | **1415.00 ± 13.77 t/s** | **59.98 ± 0.03 t/s** | Reference for pooled comparisons |
-| Pooled via RPC, even split | Same 8B model, CachyOS client + Legion 5060 worker over the direct link, `--rpc 10.0.0.2:50052` | 1222.76 ± 18.40 t/s | 60.01 ± 0.04 t/s | Backend `CUDA,RPC`; split confirmed real (section 5), but model fits on one card so tg is unaffected |
-| Pooled via RPC, split sweep 0.66–0.70 | Same 8B model, `--tensor-split` from 0.66,1 to 0.70,1 | not re-measured | 59.57–59.73 t/s | All splits within run-to-run noise; see section 5 table |
+See the full comparison table in section 6. Headline results:
+- **8B model** (fits on either card): pooling underperforms the faster solo GPU — pooled tg128 (60.01) tracks the *slower* card's solo speed (59.98 on the 2060S), not the faster one (68.27 on the 5060).
+- **14B model** (fits on neither card alone): pooling is the only way to run it well — 33.65 t/s pooled vs. a hard OOM on CachyOS solo and a degraded 3.38 t/s on Legion solo (WDDM memory spillover).
+- **`-sm row`**: unsupported over this RPC backend (`device RPC0 does not support split buffers`) — `-sm layer` is the only usable split mode here.
 
-Both machines are built on commit `957538960` and the RPC link works end to end, with the layer split now confirmed. Still to do: a model larger than one card's VRAM — the real test of pooling.
+Both machines are built on commit `957538960` and the RPC link works end to end, with the layer split confirmed both structurally (section 5) and via solo-baseline comparison (section 6). Real proof-of-pooling achieved on the 14B model.
 
 ## Command reference — everything run during network setup, debugging and the build
 
@@ -405,11 +526,13 @@ New-NetFirewallRule -DisplayName "Allow ICMPv4-In" -Protocol ICMPv4 -IcmpType 8 
 New-NetFirewallRule -DisplayName "llama RPC" -Direction Inbound -Protocol TCP -LocalPort 50052 -Action Allow -Profile Private -RemoteAddress 10.0.0.1
 ```
 
-### ufw (CachyOS firewall) — ruled out as the cause, but checked
+### ufw (CachyOS firewall)
 
 ```bash
 sudo ufw status verbose
 sudo journalctl -k --since "5 minutes ago" | grep -i "UFW BLOCK"   # kernel-level block log via journald (no /var/log/ufw.log on this system)
+# scoped rule to allow a temporary file-transfer server, same pattern as the RPC port rule:
+sudo ufw allow from 10.0.0.2 to any port 8000 proto tcp
 ```
 
 ### ISP-side throughput check (for context, not the RPC link)
@@ -440,6 +563,19 @@ ls -lh /mnt/1TB/odysseus-models/                          # -h = human-readable 
 find ~/.cache -iname "*gemma-3-1b*" 2>/dev/null           # where did -hf put it?
 cp -L <symlink path> <destination>/                      # -L = follow the symlink and copy the real file
 mv ~/odysseus/models/gemma-3-1b-it-Q4_K_M.gguf /mnt/1TB/odysseus-models/   # across drives = copy, then delete original
+```
+
+### Cross-machine model transfer over the direct link (section 6)
+
+```bash
+# CachyOS — serve the models folder on the private direct-link address only
+cd /mnt/1TB/odysseus-models
+python -m http.server 8000 --bind 10.0.0.1
+```
+```powershell
+# Legion — pull a specific file at (effectively) direct-link speed
+cd D:\odysseus\models
+curl.exe -o <filename>.gguf http://10.0.0.1:8000/<filename>.gguf
 ```
 
 ### CUDA / build toolchain checks (CachyOS)
@@ -502,6 +638,19 @@ ldd ./build/bin/llama-server | grep -i rpc
 - A CUDA0 `cudaMalloc failed: out of memory` while allocating the KV cache buffer means the split is asking the local GPU to hold more than its free VRAM — lower CUDA0's share.
 - `compute buffer allocation failed, retrying without pipeline parallelism` is llama.cpp falling back automatically when it can't also fit the small pipelining buffer — informational, not fatal.
 
+### Split-mode testing and GPU utilization logging (section 6)
+
+```fish
+# attempt a different split mode, capture verbose output for diagnosis
+./build/bin/llama-bench -m /mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99 --rpc 10.0.0.2:50052 -sm row -v 2>&1 | tee /tmp/row_test.log
+
+# confirm real dual-GPU compute during generation — run on both machines at once
+nvidia-smi --query-gpu=utilization.gpu,power.draw --format=csv -l 1 > /tmp/gpu_util_log.csv
+./build/bin/llama-server -m /mnt/1TB/odysseus-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99 --rpc 10.0.0.2:50052 --ctx-size 8192 -np 1
+# in a third terminal, once the server is up:
+curl <server completion request>
+```
+
 ### Windows MSVC toolchain and CUDA (Legion)
 
 ```powershell
@@ -532,6 +681,14 @@ bash -c 'timeout 3 bash -c "</dev/tcp/10.0.0.2/50052" && echo PORT OPEN || echo 
 pgrep -a llama                                            # any leftover llama process holding a connection?
 ```
 
+### Solo Legion benchmark (section 6)
+
+```powershell
+cd D:\odysseus\llama.cpp
+.\build\bin\Release\llama-bench.exe -m D:\odysseus\models\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf -ngl 99
+.\build\bin\Release\llama-bench.exe -m D:\odysseus\models\Qwen2.5-14B-Instruct-Q4_K_M.gguf -ngl 99
+```
+
 ## Key learnings
 
 - **Benchmark before building**: running `iperf3` early caught the satellite bottleneck before any time was sunk into llama.cpp setup on a network that couldn't support it well.
@@ -540,7 +697,7 @@ pgrep -a llama                                            # any leftover llama p
 - **Chipset consistency matters more than price**: RTL8153 was chosen specifically for in-kernel Linux driver support and native Windows support — paid a premium over unbranded alternatives deliberately, validated by the 942 Mbps/zero-retransmit result.
 - **Direct connections beat clever routing**: 942 Mbps over a direct cable vs. ~154–224 Mbps over any form of the mesh — minimizing hops and shared media wins for latency-sensitive workloads like RPC.
 - **Protect fragile physical ports**: decided to offload direct-link cable duty from Legion's hinge-mounted Ethernet port onto a USB adapter, rather than risk wearing it out with repeated connect/disconnect cycles.
-- **Live state ≠ persisted state**: `sudo ip addr add` sets an address immediately but doesn't survive a NetworkManager restart or reboot — needed a proper `nmcli` connection profile, and that kind of fix should always be reboot-tested before being marked done. A working `ping` after the fact is not that test.
+- **Live state ≠ persisted state**: `sudo ip addr add` sets an address immediately but doesn't survive a NetworkManager restart or reboot — needed a proper `nmcli` connection profile, and that kind of fix should always be reboot-tested before being marked done. A working `ping` after the fact is not that test — the actual reboot test (done 2026-09-25) confirmed the fix held.
 - **A prior, unrelated install can save a step**: CUDA was already fully installed on CachyOS from earlier hashcat work, not just the driver — worth checking what's already there (`pacman -Q`, `nvcc --version`) before assuming a clean install is needed.
 - **Shell-specific syntax breaks silently**: bash's `export PATH=...` under fish mangles PATH for that session (core commands like `uname` and `id` stop resolving); fish needs `fish_add_path`. Check `$SHELL` before pasting PATH-setting commands from generic instructions. Same family: bash's `/dev/tcp` trick needs a `bash -c` wrapper under fish.
 - **A newer toolset isn't automatically compatible**: Visual Studio 2026 shipping only the v145 MSVC toolset (no v143) meant `nvcc` had nothing validated to compile against, even though *a* compiler was technically present — CUDA toolkit/compiler version support lags behind the newest IDE toolsets.
@@ -549,16 +706,20 @@ pgrep -a llama                                            # any leftover llama p
 - **`<placeholders>` in example commands must be replaced entirely, brackets included**: the shell reads `<` as input redirection, so pasting `<file>` literally fails with a confusing "path does not exist" error.
 - **`vswhere -latest` isn't "the latest C++ install"**: it returns any Visual Studio–family product (it returned SQL Server Management Studio). Filter with `-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64`.
 - **Two different free-VRAM numbers**: `nvidia-smi` and llama.cpp report different totals (8192 MiB vs 7798 MiB on the 2060 Super). Use llama.cpp's figure when sizing models. On the Legion, Windows takes about 1 GB of the 5060 (8123 MiB total, 7043 MiB free).
-- **Pooling only pays off when the model doesn't fit on one card**: below that size, every token crossing the cable makes pooled inference slower than a single GPU, so pooled tests need a model larger than one card's free VRAM. And RPC has no authentication or encryption, so the worker should bind only to the private direct-link address and be firewalled to the client.
+- **Pooling only pays off when the model doesn't fit on one card**: below that size, every token crossing the cable makes pooled inference slower than the faster of the two solo GPUs (confirmed directly in section 6 — pooled 8B tracks the *slower* card's solo speed, not the faster one), so pooled tests need a model larger than one card's free VRAM to actually show a win. And RPC has no authentication or encryption, so the worker should bind only to the private direct-link address and be firewalled to the client.
 - **Pin the llama.cpp commit on both machines**: the RPC protocol is version-sensitive, so record `git rev-parse --short HEAD` on the first machine and `git checkout` it on the second.
 - **`-hf` hides where the model went**: it downloads into the Hugging Face cache, stored as a real file in `blobs/` plus a nicely named symlink in `snapshots/`. Copy with `cp -L` (a plain `mv` moves only the link). Better: download `.gguf` files yourself with `wget -c` into a folder you chose and load them with `-m`.
-- **The HDD only costs load time, not speed**: once the weights are in VRAM the disk isn't touched, so tokens/s is identical from an HDD or an SSD; only the first load (about 35–50 s for a 5 GB file) is slower. The internet line (~13 MB/s), not the HDD, limits downloads.
+- **The HDD only costs load time, not speed**: once the weights are in VRAM the disk isn't touched, so tokens/s is identical from an HDD or an SSD; only the first load (about 35–50 s for a 5 GB file) is slower. The internet line (~13 MB/s), not the HDD, limits downloads — the direct-link transfer in section 6 sidesteps this entirely for machine-to-machine copies.
 - **Volume label ≠ mount point**: Dolphin shows the label ("1 TB Drive"), the terminal uses the mount path (`/mnt/1TB`). Read the real path from `lsblk -f` or `mount` rather than guessing — a path with a space in it also needs quotes.
 - **Open a fresh terminal after installing tools on Windows**: a running PowerShell keeps the PATH it started with, so a successful install can still look like "command not recognized".
 - **Installer summaries can look worse than they are**: the "Nsight for VS 2022 not installed" line was irrelevant; the meaningful check was that the `CUDA 13.4.*` files appeared in the Build Tools' `BuildCustomizations` folder.
-- **Don't trust one number — check what actually happened**: the pooled 8B run showing tg128 identical to the single-GPU baseline (60.01 vs 59.98) doesn't by itself prove the model was split. `--list-devices`, `ldd`, and deliberately forcing an OOM at a low `--tensor-split` ratio are what actually proved it (section 5).
+- **Don't trust one number — check what actually happened**: the pooled 8B run showing tg128 identical to the single-GPU baseline (60.01 vs 59.98) doesn't by itself prove the model was split. `--list-devices`, `ldd`, deliberately forcing an OOM at a low `--tensor-split` ratio (section 5), and later a full solo baseline on the other card (section 6) are what actually proved and then explained it.
 - **`llama-cli` opens an interactive chat and blocks scripted runs**: piping its output to `grep` or feeding it empty input just hangs at the `>` prompt, and the log stays empty. For startup-log checks use `llama-server` (no chat prompt) or `llama-bench`.
 - **Worker log noise is normal**: repeated `Accepted client connection` / `Client connection closed` lines are the short probe connections llama.cpp makes when it enumerates devices; the worker only exits if the process itself stops (the `PS` prompt comes back).
 - **Auto-fit and manual layer counts don't mix**: setting `-ngl 99` explicitly disables llama.cpp's automatic VRAM-fitting logic, so every run in the tensor-split sweep printed `failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort` — expected noise, not an error, once you're deliberately overriding the layer count.
-- **The pipelined default split mode caps pooled speed at the slower GPU's per-layer rate**: with `-sm layer` (the default), tg128 for a model that fits on one card barely moves across tensor-split ratios (58.4–60.0 t/s the whole way from `0.66,1` to `1,1`), because the two GPUs run in relay rather than in parallel. Ratio tuning only matters for fitting a bigger model in, not for speed, on this split mode — `-sm row` or `-sm tensor` are the modes to test for actual parallel throughput.
+- **The pipelined default split mode caps pooled speed at the slower GPU's per-layer rate**: with `-sm layer` (the default), tg128 for a model that fits on one card barely moves across tensor-split ratios (58.4–60.0 t/s the whole way from `0.66,1` to `1,1`), because the two GPUs run in relay rather than in parallel. Ratio tuning only matters for fitting a bigger model in, not for speed, on this split mode.
 - **A CUDA OOM at a specific tensor-split ratio is proof of a real split, and useful proof**: deliberately pushing a split ratio (`0.50,1` → `0.65,1`) until CUDA0 fails to allocate the KV cache buffer confirmed the local GPU really was being assigned that fraction of the model — a much more direct test than reading throughput numbers, and it also mapped the exact VRAM ceiling (`0.66,1` is the practical floor for CUDA0's share on this model).
+- **The RPC backend in this llama.cpp version only supports the default pipelined split mode**: `-sm row` fails immediately at tensor-load time with `device RPC0 does not support split buffers` — a backend capability gap, not a network or config issue. `-sm tensor` would hit the same wall. `-sm layer` is the only option for pooled RPC inference here unless a future llama.cpp version adds RPC split-buffer support.
+- **Windows' WDDM shared GPU memory masks true VRAM limits**: an oversized model doesn't hard-fail on Windows the way it does on Linux (`cudaMalloc` OOM) — it can silently spill into system RAM and run at a fraction of normal speed instead. A Windows solo run "succeeding" on paper isn't proof the GPU actually held the model; check the token rate, not just whether it loaded.
+- **A direct link doubles as a private file-transfer channel**: serving a models folder with `python -m http.server` bound to the direct-link IP and pulling with `curl.exe` moved multi-gigabyte files at line-rate in place of a multi-minute WiFi/ISP redownload. Needed a scoped `ufw` rule opening the serving port to the peer's IP specifically, the same pattern already used for the RPC port.
+- **Comparing solo baselines on both cards, not just one, makes pooled numbers interpretable**: the pooled 8B tg128 (60.01 t/s) sitting almost exactly at the 2060 Super's solo number (59.98) rather than the 5060's (68.27) is what actually proves — with real numbers instead of inference — that pipelined layer-split caps throughput at the slowest card in the chain.
