@@ -69,11 +69,11 @@ The direct cable solved the RPC link but left CachyOS with no internet (its one 
 
 Buying a **second RTL8153-based USB-Ethernet adapter for Legion**, sourced in person through an ISP technician contact rather than an unbranded online listing. This will take over the direct RPC cable on Legion's end, freeing Legion's onboard Ethernet port (a fragile hinge-mounted connector) from repeated plug/unplug wear. Not required to keep building — the current onboard-to-onboard link is what's in use.
 
-## 4. Inference layer — llama.cpp build (both machines built and verified; first pooled run done)
+## 4. Inference layer — llama.cpp build (both machines built and verified; pooled run done, layer split confirmed)
 
 With the network link validated, moved on to building `llama.cpp` with CUDA + RPC support on both machines, so CachyOS can run `llama-server` as the main node and Legion can run `ggml-rpc-server` as a worker, pooling the 2060 Super and 5060 into one inference target.
 
-The subsections below are grouped per machine, but the work was interleaved. Actual order of events (2026-09-23 → 2026-09-24, the session ran past midnight):
+The subsections below are grouped per machine, but the work was interleaved. Actual order of events (2026-09-23 → 2026-09-25, the first session ran past midnight):
 
 1. CachyOS: checked the existing CUDA install (already present from hashcat work).
 2. CachyOS: installed `cmake`.
@@ -90,7 +90,9 @@ The subsections below are grouped per machine, but the work was interleaved. Act
 13. Legion: cloned llama.cpp to `D:\odysseus`, checked out `957538960`, configured with arch `120`, built; `llama-server --list-devices` sees the 5060.
 14. Legion: added the firewall rule for TCP 50052, started `ggml-rpc-server` bound to `10.0.0.2`.
 15. CachyOS: `ping` and a raw TCP port check to `10.0.0.2:50052` both succeeded.
-16. CachyOS: first pooled `llama-bench` run with `--rpc` (pp512 1223 t/s, tg128 60.01 t/s). **How the layers were actually split is not yet verified.**
+16. CachyOS: first pooled `llama-bench` run with `--rpc` (pp512 1223 t/s, tg128 60.01 t/s). At this point how the layers were actually split was not yet verified.
+17. CachyOS: confirmed the split is real — `--rpc 10.0.0.2:50052 --list-devices` lists both `CUDA0` (2060 Super) and `RPC0` (Legion), and `ldd ./build/bin/llama-server | grep -i rpc` shows `libggml-rpc.so.0` linked.
+18. CachyOS: swept `--tensor-split` on the 8B model to find the OOM boundary on the 2060 Super and check whether the split ratio moves throughput. See section 5.
 
 ### CachyOS
 
@@ -219,7 +221,7 @@ bash -c 'timeout 3 bash -c "</dev/tcp/10.0.0.2/50052" && echo PORT OPEN || echo 
 ```
 The `bash -c` wrapper exists because `/dev/tcp` is a bash feature that fish doesn't have. Each connection the worker receives prints `Accepted client connection` / `Client connection closed` in its window; llama.cpp opens several short probe connections at startup to query devices and free memory, so multiple pairs of those lines are normal and don't mean the worker died.
 
-**Unresolved oddity:** `llama-server --rpc 10.0.0.2:50052 --list-devices` printed only its `initializing ...` line and no device list. `llama-bench --rpc` worked fine right after, so the RPC path is OK; the cause of the `--list-devices` behavior wasn't identified and it isn't needed.
+**Unresolved oddity:** `llama-server --rpc 10.0.0.2:50052 --list-devices` printed only its `initializing ...` line and no device list on the *first* attempt. `llama-bench --rpc` worked fine right after, so the RPC path is OK; this turned out to be transient — a later retry (see section 5) printed the full device list correctly.
 
 **First pooled run** (worker running on Legion, model on CachyOS's HDD):
 ```fish
@@ -227,15 +229,57 @@ The `bash -c` wrapper exists because `/dev/tcp` is a bash feature that fish does
 ```
 - The backend column read `CUDA,RPC`; the Legion's worker log showed `CUDA graph warmup complete`, so the 5060 really computed for CachyOS.
 - **pp512 1222.76 ± 18.40 t/s, tg128 60.01 ± 0.04 t/s** — prompt processing about 14% below the single-GPU baseline (1415), generation identical to it (59.98).
-- **Read this with care:** an 8B Q4 model fits on the 2060 Super alone, so pooling can't be expected to help, and the identical tg128 raises the question of how much of the model actually went to the Legion. The startup log of a pooled run (per-device `model buffer size` lines) has not been captured yet, so the layer split is **unverified**. The real proof of pooling is a model too big for one card.
+- **Read this with care:** an 8B Q4 model fits on the 2060 Super alone, so pooling can't be expected to help, and the identical tg128 raised the question of how much of the model actually went to the Legion. Resolved in section 5.
+
+## 5. Layer-split verification and tensor-split sweep (2026-09-25)
+
+Goal: settle whether the "first pooled run" above actually split the model across both GPUs, and if so, whether the split ratio changes throughput.
+
+**Device visibility check:**
+```fish
+./build/bin/llama-server --rpc 10.0.0.2:50052 --list-devices
+```
+```
+Available devices:
+  CUDA0: NVIDIA GeForce RTX 2060 SUPER (7798 MiB, 6438 MiB free)
+  RPC0: 10.0.0.2:50052 (8123 MiB, 7029 MiB free)
+```
+Both devices are correctly enumerated through the RPC path. Also confirmed the binary is actually linking the RPC backend:
+```fish
+ls -l ./build/bin/ | grep -i rpc          # ggml-rpc-server, libggml-rpc.so(.0)(.25.0), test-rpc-multi-server present
+ldd ./build/bin/llama-server | grep -i rpc  # libggml-rpc.so.0 => .../build/bin/libggml-rpc.so.0
+```
+
+**Tensor-split sweep, 8B Q4_K_M, `-ngl 99 --rpc 10.0.0.2:50052`:**
+
+| `--tensor-split` (CUDA0,RPC0) | Result | tg (1000-token run) |
+|---|---|---|
+| `1,1` (even) | Loads clean | ~59.6–60.0 t/s (varies within-run) |
+| `0.50,1` | **Fails** — CUDA0 OOM allocating ~4011 MiB KV cache buffer | — |
+| `0.60,1` | **Fails** — CUDA0 OOM allocating ~3629 MiB | — |
+| `0.65,1` | **Fails** — CUDA0 OOM allocating ~3629 MiB | — |
+| `0.66,1` | Loads, but `compute buffer allocation failed, retrying without pipeline parallelism` | 59.61 t/s |
+| `0.67,1` | Loads, same fallback warning; repeated twice | 59.69 t/s / 59.60 t/s |
+| `0.68,1` | Loads, same fallback warning | 59.73 t/s (highest observed) |
+| `0.69,1` | Loads, same fallback warning | 59.62 t/s |
+| `0.70,1` | Loads clean, no fallback warning | 59.57 t/s |
+
+Benchmark prompt used for the 1000-token runs: *"Write a very detailed explanation of distributed computing, GPU parallelism, model parallelism, pipeline parallelism, tensor parallelism, and why multiple GPUs can be useful for running large language models. Explain each concept carefully with examples."* (`n_predict: 1000`).
+
+**Findings:**
+- **The split is real.** `0.50`–`0.65` failing with a CUDA0 out-of-memory error while trying to allocate the KV cache buffer is direct proof CUDA0 (the 2060 Super) was being asked to hold a specific, non-trivial share of the model — a purely-remote setup wouldn't OOM the local card at all. `0.66` is the practical lower bound for CUDA0's share before the 2060 Super runs out of the ~6.4 GB llama.cpp reports free.
+- **The split ratio barely moves throughput.** Every successful split — including the even `1,1` split — lands in the same ~58.4–60.0 t/s band, and that spread shows up *within* a single run (task-to-task) as much as it does *between* different split ratios. `0.68,1`'s 59.73 t/s is not a meaningful win over `0.67,1`'s 59.60–59.69 t/s.
+- **Why:** the default split mode is `-sm layer` (pipelined) — each token's forward pass runs through CUDA0's layers, then RPC0's layers, in sequence. The two GPUs never compute simultaneously on the same token, so total tg tracks whichever GPU is slower per layer, not the sum of both cards' capacity. Shifting the ratio changes *which* GPU is closer to being the bottleneck, but with two cards of broadly similar per-layer speed on a model that already fits, it doesn't change the outcome much.
+- **The `compute buffer allocation failed, retrying without pipeline parallelism` warning at 0.66–0.69** is a secondary symptom of the same VRAM ceiling: llama.cpp tries to reserve a pipelining compute buffer on CUDA0, can't fit it in the remaining headroom, and falls back to non-pipelined execution automatically. It didn't cost throughput here, but it's a sign this GPU is right at its limit for this split range.
+- **Practical takeaway:** for a model that fits on one card, tensor-split tuning isn't worth the time — pick something that loads cleanly without the fallback warning (e.g. `1,1` or `0.70,1`) and move on. The real test of pooling is a model that requires the combined VRAM to run at all.
 
 ### Open items (inference layer)
 
-1. Verify the layer split of the pooled run: capture the per-device `model buffer size` lines from a `llama-server` startup (`llama-cli` isn't suitable, see learnings), and watch the 5060's dedicated memory in Task Manager. If nothing landed on the RPC device, force a split with `--tensor-split`.
-2. Pooled test with a model **larger than one card's free VRAM** (~13–14B at Q4, about 8–9 GB), which can only run through the pool. Then benchmark (tok/s, GPU utilization, VRAM, network, best tensor split — weighted toward the 5060 rather than an even split), and consider `-c` on the worker to avoid re-sending weights on every restart.
-3. Reboot check of the `10.0.0.1` static IP and an `iperf3` re-run (still unconfirmed).
-4. Baseline of the same 8B model on the 5060 alone (Legion), for comparison.
-5. Move the 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models`.
+1. **Pooled test with a model larger than one card's free VRAM** (~13–14B at Q4, about 8–9 GB), which can only run through the pool. This is the real test of whether pooling helps, since the 8B tests above were bottlenecked by the slower GPU per layer regardless of tensor-split ratio. Benchmark tok/s, GPU utilization, VRAM, and try `-sm row` or `-sm tensor` in addition to the default `layer` split, since parallel split modes may behave differently across a slow network link than the pipelined default. Consider `-c` on the worker to avoid re-sending weights on every restart.
+2. Reboot check of the `10.0.0.1` static IP and an `iperf3` re-run (still unconfirmed).
+3. Baseline of the same 8B model on the 5060 alone (Legion), for comparison.
+4. Move the 1B smoke-test model from `~/odysseus/models` to `/mnt/1TB/odysseus-models`.
+5. README status section needs updating to match this log.
 
 ## Benchmark results
 
@@ -251,15 +295,16 @@ The `bash -c` wrapper exists because `/dev/tcp` is a bash feature that fish does
 
 Direct link latency on 2026-09-24: ping 1.98 / 2.19 / 2.48 ms (min/avg/max), 0% loss.
 
-**Inference layer (in progress):**
+**Inference layer (8B model fully characterized; larger-than-VRAM model still to test):**
 
 | Test | Setup | Prompt (pp512) | Generation (tg128) | Notes |
 |---|---|---|---|---|
 | Single GPU, smoke test | RTX 2060 Super, Gemma 3 1B Q4_K_M, `llama-cli`, commit `957538960` | 252.5 t/s | 160.2 t/s | Tiny model and short prompt; pipeline check only |
 | **Single GPU, baseline** | RTX 2060 Super, Llama 3.1 8B Q4_K_M (4.58 GiB), `llama-bench -ngl 99` | **1415.00 ± 13.77 t/s** | **59.98 ± 0.03 t/s** | Reference for pooled comparisons |
-| Pooled via RPC | Same 8B model, CachyOS client + Legion 5060 worker over the direct link, `--rpc 10.0.0.2:50052` | 1222.76 ± 18.40 t/s | 60.01 ± 0.04 t/s | Backend `CUDA,RPC`; worker computed (CUDA graph warmup logged), but per-device split not yet verified |
+| Pooled via RPC, even split | Same 8B model, CachyOS client + Legion 5060 worker over the direct link, `--rpc 10.0.0.2:50052` | 1222.76 ± 18.40 t/s | 60.01 ± 0.04 t/s | Backend `CUDA,RPC`; split confirmed real (section 5), but model fits on one card so tg is unaffected |
+| Pooled via RPC, split sweep 0.66–0.70 | Same 8B model, `--tensor-split` from 0.66,1 to 0.70,1 | not re-measured | 59.57–59.73 t/s | All splits within run-to-run noise; see section 5 table |
 
-Both machines are built on commit `957538960` and the RPC link works end to end. Still to do: verify the split, then a model larger than one card's VRAM.
+Both machines are built on commit `957538960` and the RPC link works end to end, with the layer split now confirmed. Still to do: a model larger than one card's VRAM — the real test of pooling.
 
 ## Command reference — everything run during network setup, debugging and the build
 
@@ -435,6 +480,28 @@ mkdir -p ~/odysseus/models                # local model folder
 - `-ngl 99` = offload up to 99 layers to the GPU(s), i.e. everything.
 - The `--rpc` run prints `CUDA,RPC` in the backend column when the remote device is in use.
 
+### Layer-split verification and tensor-split sweep (section 5)
+
+```fish
+# confirm both devices are visible through the RPC path
+./build/bin/llama-server --rpc 10.0.0.2:50052 --list-devices
+
+# confirm the binary actually links the RPC backend
+ls -l ./build/bin/ | grep -i rpc
+ldd ./build/bin/llama-server | grep -i rpc
+
+# run the server with a specific split and watch it load
+./build/bin/llama-server \
+    -m /mnt/1TB/odysseus-models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+    -ngl 99 \
+    --rpc 10.0.0.2:50052 \
+    --tensor-split 0.67,1        # fraction of the model on CUDA0,RPC0 — not a percentage, a ratio
+```
+- `--tensor-split N0,N1,...` sets each device's share of the model as a ratio, one number per device in the order `--list-devices` reports them (here CUDA0 then RPC0).
+- `-fit`/`--fit` (auto-fit) is what `-ngl 99` combined with an explicit split disables — hence the harmless `failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort` line on every run in this sweep; it just means llama.cpp isn't auto-picking layer counts because they were already forced.
+- A CUDA0 `cudaMalloc failed: out of memory` while allocating the KV cache buffer means the split is asking the local GPU to hold more than its free VRAM — lower CUDA0's share.
+- `compute buffer allocation failed, retrying without pipeline parallelism` is llama.cpp falling back automatically when it can't also fit the small pipelining buffer — informational, not fatal.
+
 ### Windows MSVC toolchain and CUDA (Legion)
 
 ```powershell
@@ -489,6 +556,9 @@ pgrep -a llama                                            # any leftover llama p
 - **Volume label ≠ mount point**: Dolphin shows the label ("1 TB Drive"), the terminal uses the mount path (`/mnt/1TB`). Read the real path from `lsblk -f` or `mount` rather than guessing — a path with a space in it also needs quotes.
 - **Open a fresh terminal after installing tools on Windows**: a running PowerShell keeps the PATH it started with, so a successful install can still look like "command not recognized".
 - **Installer summaries can look worse than they are**: the "Nsight for VS 2022 not installed" line was irrelevant; the meaningful check was that the `CUDA 13.4.*` files appeared in the Build Tools' `BuildCustomizations` folder.
-- **Don't trust one number — check what actually happened**: the pooled 8B run showing tg128 identical to the single-GPU baseline (60.01 vs 59.98) doesn't prove the model was split. Read the per-device buffer sizes in the startup log, and test with a model that can't fit on one card.
+- **Don't trust one number — check what actually happened**: the pooled 8B run showing tg128 identical to the single-GPU baseline (60.01 vs 59.98) doesn't by itself prove the model was split. `--list-devices`, `ldd`, and deliberately forcing an OOM at a low `--tensor-split` ratio are what actually proved it (section 5).
 - **`llama-cli` opens an interactive chat and blocks scripted runs**: piping its output to `grep` or feeding it empty input just hangs at the `>` prompt, and the log stays empty. For startup-log checks use `llama-server` (no chat prompt) or `llama-bench`.
 - **Worker log noise is normal**: repeated `Accepted client connection` / `Client connection closed` lines are the short probe connections llama.cpp makes when it enumerates devices; the worker only exits if the process itself stops (the `PS` prompt comes back).
+- **Auto-fit and manual layer counts don't mix**: setting `-ngl 99` explicitly disables llama.cpp's automatic VRAM-fitting logic, so every run in the tensor-split sweep printed `failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort` — expected noise, not an error, once you're deliberately overriding the layer count.
+- **The pipelined default split mode caps pooled speed at the slower GPU's per-layer rate**: with `-sm layer` (the default), tg128 for a model that fits on one card barely moves across tensor-split ratios (58.4–60.0 t/s the whole way from `0.66,1` to `1,1`), because the two GPUs run in relay rather than in parallel. Ratio tuning only matters for fitting a bigger model in, not for speed, on this split mode — `-sm row` or `-sm tensor` are the modes to test for actual parallel throughput.
+- **A CUDA OOM at a specific tensor-split ratio is proof of a real split, and useful proof**: deliberately pushing a split ratio (`0.50,1` → `0.65,1`) until CUDA0 fails to allocate the KV cache buffer confirmed the local GPU really was being assigned that fraction of the model — a much more direct test than reading throughput numbers, and it also mapped the exact VRAM ceiling (`0.66,1` is the practical floor for CUDA0's share on this model).
